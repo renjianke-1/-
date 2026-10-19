@@ -1,0 +1,645 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+================================================================
+Raspbot V2 视觉巡线（单文件版 / 逐轮连续 PID）
+黑底白边 + 中间白线干扰
+================================================================
+硬件/库：
+  驱动：from Raspbot_Lib import Raspbot，bot.Ctrl_Muto(id, -255~255)
+        电机 0=L1 1=L2(左)  2=R1 3=R2(右)
+  相机：cv2.VideoCapture(0)   （USB 摄像头 /dev/video0）
+
+算法：
+  二值化 -> 轮廓提取去噪 -> 逐行取最左/最右白点(丢掉中间干扰白线)
+  -> 左右边点各拟合 x=a*y+b -> 求轨迹中线 -> 与图像中线做差
+  -> PID -> 左右两侧轮速差速控制
+
+安全：
+  Ctrl+C / 异常 / 退出都会：停车 + 释放摄像头 + del bot。
+================================================================
+"""
+
+import argparse
+import signal
+import socket
+import sys
+import threading
+import time
+from dataclasses import dataclass
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+import cv2
+import numpy as np
+
+# 驱动库路径（按实际改）
+sys.path.append('/home/pi/project_demo/lib')
+try:
+    from Raspbot_Lib import Raspbot
+    HAS_ROBOT = True
+except Exception as e:
+    HAS_ROBOT = False
+    print(f"[warn] 未导入 Raspbot_Lib ({e})，使用虚拟电机(mock)")
+
+    class Raspbot:                       # 电脑上测试用的假对象
+        def Ctrl_Muto(self, motor_id, speed=0):
+            print(f"    <mock> Ctrl_Muto({motor_id}, {speed})")
+
+        def Ctrl_Car(self, motor_id, motor_dir, motor_speed=0):
+            print(f"    <mock> Ctrl_Car({motor_id}, {motor_dir}, {motor_speed})")
+
+
+# ====================== 网页视频流（--stream） ======================
+class _Stream:
+    """存放最新一帧 JPEG，供 HTTP 线程读取。"""
+
+    def __init__(self):
+        self.frame = None
+        self.lock = threading.Lock()
+
+    def set(self, jpg):
+        with self.lock:
+            self.frame = jpg
+
+    def get(self):
+        with self.lock:
+            return self.frame
+
+
+STREAM = _Stream()
+
+
+class _StreamHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path in ("/", "/index.html"):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(
+                b'<html><head><meta name="viewport" content="width=device-width,initial-scale=1">'
+                b'</head><body style="margin:0;background:#111;text-align:center">'
+                b'<h3 style="color:#0f0;font-family:sans-serif">Raspbot Line Follower</h3>'
+                b'<img src="/stream" style="width:96%;max-width:720px"></body></html>')
+        elif self.path == "/stream":
+            self.send_response(200)
+            self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
+            self.end_headers()
+            while True:
+                jpg = STREAM.get()
+                if jpg is None:
+                    time.sleep(0.05)
+                    continue
+                try:
+                    self.wfile.write(b"--frame\r\nContent-Type: image/jpeg\r\n\r\n"
+                                     + jpg + b"\r\n")
+                except Exception:
+                    break
+                time.sleep(0.03)
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def log_message(self, *args):   # 关掉刷屏的访问日志
+        pass
+
+
+def start_stream_server(port):
+    srv = HTTPServer(("0.0.0.0", port), _StreamHandler)
+    t = threading.Thread(target=srv.serve_forever, daemon=True)
+    t.start()
+    print(f"[stream] 在电脑浏览器打开: http://<树莓派IP>:{port}/   （本机 IP 见下方 ip 命令）")
+    return srv
+
+
+# ============================ 机器参数 ============================
+MOTOR_LEFT = (0, 1)          # 左侧电机编号 L1, L2
+MOTOR_RIGHT = (2, 3)         # 右侧电机编号 R1, R2
+MOTOR_SIGN = {0: 1, 1: 1, 2: 1, 3: 1}   # 某轮方向反了就把对应值改成 -1
+
+BASE_SPEED = 40              # 直行基础速度 0-255
+MAX_SPEED = 200              # 单轮上限
+MIN_SPEED = -20              # 单轮下限(允许内侧轮略反转，转弯更利落)
+LOST_TURN_SPEED = 150        # 丢线左转力度 0-255
+LOST_TIMEOUT = 0           # 0=丢线后不停车；>0=丢线超过该秒数才停车
+LOST_STRAIGHT_DELAY = 0.2    # 检测到左转后，先直行这么多秒，再左转
+LOST_TURN_TIME = 0.5         # 左转持续秒数，之后直行直到找到赛道
+KP, KI, KD = 120.0, 0.0, 20.0
+I_LIMIT = 200.0
+
+
+# ============================ 视觉配置 ============================
+@dataclass
+class Config:
+    cam_width: int = 320
+    cam_height: int = 240
+    roi_top_ratio: float = 0.4     # 只处理图像下方这一段（0~1）
+    blur_ksize: int = 5
+    threshold: int = 160            # 固定阈值(仅 use_adaptive=False 时用)
+    use_adaptive: bool = True       # 自适应阈值：对光照/反光更稳（默认开）
+    adaptive_block: int = 31        # 自适应阈值窗口(奇数)
+    adaptive_C: int = -15           # 自适应阈值偏移
+    min_contour_area: float = 60.0
+    min_pts_per_line: int = 10
+    outlier_thresh: float = 12.0
+    min_track_width_ratio: float = 0.35
+    max_track_width_ratio: float = 1.10
+    error_row_ratio: float = 0.90   # 在这一行计算横向误差
+    # 目标中线偏移(归一化): >0 让车往右修, <0 往左修（相机没装正/总偏一侧时调）
+    center_offset: float = -0.1
+    # 左右轮配平(0-255): >0 右轮加强/左轮减弱(纠车往左跑), <0 反之
+    wheel_balance: float = 0
+    # 运行方式
+    show: bool = False
+    save_debug: str = ""
+    save_every: float = 0.5
+    print_every: float = 0.5
+
+
+def clamp(v, lo, hi):
+    return max(lo, min(hi, v))
+
+
+# ========================= 图像处理 =========================
+def binarize(frame, cfg):
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    k = cfg.blur_ksize
+    if k % 2 == 0:
+        k += 1
+    if k >= 3:
+        gray = cv2.GaussianBlur(gray, (k, k), 0)
+    if cfg.use_adaptive:
+        binary = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_MEAN_C,
+                                       cv2.THRESH_BINARY,
+                                       cfg.adaptive_block, cfg.adaptive_C)
+    else:
+        _, binary = cv2.threshold(gray, cfg.threshold, 255, cv2.THRESH_BINARY)
+    return cv2.morphologyEx(binary, cv2.MORPH_OPEN,
+                            cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)))
+
+
+def clean_white_mask(binary, cfg):
+    contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    kept = [c for c in contours if cv2.contourArea(c) >= cfg.min_contour_area]
+    mask = np.zeros_like(binary)
+    if kept:
+        cv2.drawContours(mask, kept, -1, 255, thickness=cv2.FILLED)
+    return mask
+
+
+def extract_outer_edges(mask, roi_top):
+    """逐行取最左/最右白点 -> 丢掉中间干扰白线。"""
+    left_pts, right_pts = [], []
+    for y in range(roi_top, mask.shape[0]):
+        xs = np.flatnonzero(mask[y] > 0)
+        if xs.size < 2:
+            continue
+        left_pts.append((float(xs[0]), float(y)))
+        right_pts.append((float(xs[-1]), float(y)))
+    left = np.array(left_pts, dtype=np.float64).reshape(-1, 2)
+    right = np.array(right_pts, dtype=np.float64).reshape(-1, 2)
+    return left, right
+
+
+def fit_x_of_y(points, cfg):
+    """拟合 x = a*y + b，带离群点剔除。"""
+    if points is None or len(points) < cfg.min_pts_per_line:
+        return None
+    ys = points[:, 1].copy()
+    xs = points[:, 0].copy()
+    try:
+        a, b = np.polyfit(ys, xs, 1)
+    except Exception:
+        return None
+    for _ in range(2):
+        resid = np.abs(a * ys + b - xs)
+        keep = resid < cfg.outlier_thresh
+        if keep.sum() < cfg.min_pts_per_line or keep.all():
+            break
+        ys, xs = ys[keep], xs[keep]
+        a, b = np.polyfit(ys, xs, 1)
+    return float(a), float(b)
+
+
+def analyze(frame, cfg):
+    """返回 (error, info)，error 约 -1~1，>0 表示赛道中心在图像中心右侧。"""
+    h, w = frame.shape[:2]
+    binary = binarize(frame, cfg)
+    mask = clean_white_mask(binary, cfg)
+    roi_top = int(h * cfg.roi_top_ratio)
+    left_pts, right_pts = extract_outer_edges(mask, roi_top)
+    left_line = fit_x_of_y(left_pts, cfg)
+    right_line = fit_x_of_y(right_pts, cfg)
+
+    info = {"roi_top": roi_top, "error_row": int(h * cfg.error_row_ratio),
+            "center": w / 2.0, "left_pts": left_pts, "right_pts": right_pts,
+            "left_line": left_line, "right_line": right_line}
+
+    if left_line is None or right_line is None:
+        return None, info
+
+    y_err = info["error_row"]
+    lx = left_line[0] * y_err + left_line[1]
+    rx = right_line[0] * y_err + right_line[1]
+    info["lx"], info["rx"] = lx, rx
+    track_w = rx - lx
+    if track_w < w * cfg.min_track_width_ratio or track_w > w * cfg.max_track_width_ratio:
+        info["reject"] = f"赛道宽度异常 {track_w:.0f}px"
+        return None, info
+
+    center_x = 0.5 * (lx + rx)
+    info["track_center"] = center_x
+    return (center_x - info["center"]) / (w / 2.0) + cfg.center_offset, info
+
+
+# ============================ PID ============================
+class PID:
+    def __init__(self, kp, ki, kd, i_limit=I_LIMIT):
+        self.kp, self.ki, self.kd, self.i_limit = kp, ki, kd, i_limit
+        self.reset()
+
+    def reset(self):
+        self.integral = 0.0
+        self.prev_error = 0.0
+        self.prev_t = None
+
+    def update(self, error, now):
+        dt = 0.0 if self.prev_t is None else (now - self.prev_t)
+        self.prev_t = now
+        if dt > 1e-4:
+            self.integral += error * dt
+            self.integral = clamp(self.integral, -self.i_limit, self.i_limit)
+        derivative = (error - self.prev_error) / dt if dt > 1e-4 else 0.0
+        self.prev_error = error
+        return self.kp * error + self.ki * self.integral + self.kd * derivative
+
+
+# ======================== 调试绘制 ========================
+def draw_debug(frame, error, info, steer, fps):
+    vis = frame.copy()
+    h, w = vis.shape[:2]
+    cv2.line(vis, (0, info["roi_top"]), (w, info["roi_top"]), (0, 165, 255), 1)
+    cv2.line(vis, (w // 2, 0), (w // 2, h), (0, 255, 0), 1)
+    y_err = info["error_row"]
+    cv2.line(vis, (0, y_err), (w, y_err), (255, 0, 255), 1)
+    for p in info["left_pts"][::3]:
+        cv2.circle(vis, (int(p[0]), int(p[1])), 1, (255, 255, 0), -1)
+    for p in info["right_pts"][::3]:
+        cv2.circle(vis, (int(p[0]), int(p[1])), 1, (0, 255, 255), -1)
+    for name, color in (("left_line", (255, 0, 0)), ("right_line", (0, 0, 255))):
+        line = info.get(name)
+        if line:
+            y1, y2 = info["roi_top"], h - 1
+            cv2.line(vis, (int(line[0] * y1 + line[1]), y1),
+                     (int(line[0] * y2 + line[1]), y2), color, 2)
+    ll, rl = info.get("left_line"), info.get("right_line")
+    if ll and rl:
+        y1, y2 = info["roi_top"], h - 1
+        cx1 = int(0.5 * ((ll[0] * y1 + ll[1]) + (rl[0] * y1 + rl[1])))
+        cx2 = int(0.5 * ((ll[0] * y2 + ll[1]) + (rl[0] * y2 + rl[1])))
+        cv2.line(vis, (cx1, y1), (cx2, y2), (0, 255, 0), 2)
+        if "track_center" in info:
+            cv2.circle(vis, (int(info["track_center"]), int(y_err)), 5, (0, 0, 255), -1)
+    text = (f"err={error:+.3f} steer={steer:+.0f} {fps:4.1f}fps"
+            if error is not None else "LOST")
+    cv2.putText(vis, text, (5, 15), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 0), 1, cv2.LINE_AA)
+    return vis
+
+
+# ========================= 电机控制 =========================
+class RaspbotWheels:
+    """逐轮连续控制：左 = (0,1)，右 = (2,3)。"""
+
+    def __init__(self, bot):
+        self.bot = bot
+
+    @staticmethod
+    def _apply(sign, speed):
+        speed = int(round(clamp(speed, -255, 255)))
+        return speed * sign
+
+    def set(self, left, right):
+        for m in MOTOR_LEFT:
+            self.bot.Ctrl_Muto(m, self._apply(MOTOR_SIGN[m], left))
+        for m in MOTOR_RIGHT:
+            self.bot.Ctrl_Muto(m, self._apply(MOTOR_SIGN[m], right))
+
+    def stop(self):
+        self.set(0, 0)
+
+
+# ============================ 主程序 ============================
+def build_argparser():
+    p = argparse.ArgumentParser(description="Raspbot V2 视觉巡线（逐轮 PID）")
+    p.add_argument("--video", default="", help="用视频文件/摄像头序号代替默认相机")
+    p.add_argument("--camera", type=int, default=0, help="USB 摄像头序号，默认 0")
+    p.add_argument("--mock", action="store_true", help="虚拟电机，不驱动")
+    p.add_argument("--show", action="store_true", help="显示调试图(需本地桌面/VNC)")
+    p.add_argument("--save-debug", default="", help="保存调试图路径(按间隔覆盖)")
+    p.add_argument("--record", default="", help="录调试画面到 mp4（SSH 调试推荐）")
+    p.add_argument("--stream", type=int, default=0,
+                   help="开启网页视频流，如 --stream 8000，浏览器打开 http://树莓派IP:8000")
+    p.add_argument("--no-drive", action="store_true",
+                   help="只显示不驱动电机（配合 --stream 看画面）")
+    p.add_argument("--udp", default="",
+                   help="把画面用UDP发到电脑，如 --udp 192.168.0.128:9999")
+    p.add_argument("--udp-raw", default="",
+                   help="发送【原始未标注】画面到电脑，用于调参，如 --udp-raw 192.168.0.128:9999")
+    p.add_argument("--max-frames", type=int, default=0, help="处理 N 帧后退出")
+    p.add_argument("--print-every", type=float, default=0.5)
+    p.add_argument("--base-speed", type=float, default=None)
+    p.add_argument("--center-offset", type=float, default=None,
+                   help="目标中线偏移(归一化): >0 让车往右修, <0 往左修")
+    p.add_argument("--wheel-balance", type=float, default=None,
+                   help="左右轮配平 0-255: >0 纠车往左跑")
+    p.add_argument("--kp", type=float, default=None)
+    p.add_argument("--ki", type=float, default=None)
+    p.add_argument("--kd", type=float, default=None)
+    p.add_argument("--threshold", type=int, default=None)
+    p.add_argument("--adaptive", action="store_true", help="使用自适应阈值(默认已开)")
+    p.add_argument("--no-adaptive", action="store_true", help="改用固定阈值")
+    p.add_argument("--first-turn", choices=["0", "1"], default=None,
+                   help="第1次丢线: 0=左转, 1=直线(不给则第一次丢线时提示输入)")
+    p.add_argument("--lost-turn-speed", type=float, default=None, help="丢线左转力度 0-255(默认150)")
+    p.add_argument("--lost-timeout", type=float, default=None, help="丢线超时停车秒数; 0=不停车(默认0)")
+    p.add_argument("--lost-straight-delay", type=float, default=None, help="检测到左转后先直行秒数(默认0.1)")
+    p.add_argument("--lost-turn-time", type=float, default=None, help="左转持续秒数，之后直行(默认0.5)")
+    p.add_argument("--calibrate", action="store_true",
+                   help="标定模式：逐个电机转一下，观察方向（先架空车轮）")
+    return p
+
+
+def open_camera(args):
+    src = args.video if args.video else args.camera
+    if isinstance(src, str) and src.isdigit():
+        src = int(src)
+    cap = cv2.VideoCapture(src)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+    print(f"[camera] {'打开成功' if cap.isOpened() else '打开失败'}: {src}")
+    return cap
+
+
+def run_calibrate(wheels):
+    """逐个电机 +100 转 1.5 秒，观察哪个轮子动、方向对不对。"""
+    print("[calibrate] 依次驱动电机 0~3（+100），请观察；先架空车轮！")
+    for m in range(4):
+        print(f"  电机 {m} ...")
+        wheels.bot.Ctrl_Muto(m, 100)
+        time.sleep(1.5)
+        wheels.bot.Ctrl_Muto(m, 0)
+        time.sleep(0.3)
+    print("[calibrate] 完成。若某个轮子后退/不动，改 MOTOR_SIGN 对应值(1/-1)。")
+
+
+def main():
+    args = build_argparser().parse_args()
+
+    cfg = Config()
+    cfg.show = args.show
+    cfg.save_debug = args.save_debug
+    cfg.print_every = args.print_every
+    base = BASE_SPEED if args.base_speed is None else args.base_speed
+
+    # 第1次丢线方向：优先 --first-turn；否则等真正第一次丢线时再询问
+    if args.first_turn is not None:
+        first_dir = int(args.first_turn)
+        print(f"[main] 第1次丢线: {'左转' if first_dir == 0 else '直线'}（命令行指定）")
+    else:
+        first_dir = None
+        print("[main] 第1次丢线时会停下并提示你输入: 0=左转, 1=直线")
+
+    lost_speed = LOST_TURN_SPEED if args.lost_turn_speed is None else args.lost_turn_speed
+    lost_timeout = LOST_TIMEOUT if args.lost_timeout is None else args.lost_timeout
+    lost_turn_time = LOST_TURN_TIME if args.lost_turn_time is None else args.lost_turn_time
+    straight_delay = LOST_STRAIGHT_DELAY if args.lost_straight_delay is None else args.lost_straight_delay
+    if args.threshold is not None:
+        cfg.threshold = args.threshold
+    if args.adaptive:
+        cfg.use_adaptive = True
+    if args.no_adaptive:
+        cfg.use_adaptive = False
+    if args.center_offset is not None:
+        cfg.center_offset = args.center_offset
+    if args.wheel_balance is not None:
+        cfg.wheel_balance = args.wheel_balance
+    print(f"[main] 基础速度={base:.0f}  中线偏移={cfg.center_offset:+.2f}  左右配平={cfg.wheel_balance:+.0f}"
+          f"  丢线: 先直行{straight_delay:.2f}s 再左转{lost_turn_time:.2f}s 后直行找线")
+    kp = KP if args.kp is None else args.kp
+    ki = KI if args.ki is None else args.ki
+    kd = KD if args.kd is None else args.kd
+
+    running = True
+
+    def on_stop(signum, frame):
+        nonlocal running
+        running = False
+        print("\n[main] 收到停止信号，停车退出…")
+
+    signal.signal(signal.SIGINT, on_stop)
+    try:
+        signal.signal(signal.SIGTERM, on_stop)
+    except Exception:
+        pass
+
+    bot = Raspbot()
+    wheels = RaspbotWheels(bot)
+    wheels.stop()
+
+    def apply(l, r):
+        if not args.no_drive:
+            wheels.set(l, r)
+
+    if args.calibrate:
+        try:
+            run_calibrate(wheels)
+        finally:
+            wheels.stop()
+            del bot
+        return
+
+    cap = open_camera(args)
+    pid = PID(kp, ki, kd)
+
+    stream_on = args.stream > 0
+    if stream_on:
+        start_stream_server(args.stream)
+    if args.no_drive:
+        print("[main] --no-drive：只显示/识别，不驱动电机")
+
+    udp_sock = None
+    udp_addr = None
+    udp_raw_sock = None
+    udp_raw_addr = None
+    if args.udp:
+        host, _, port = args.udp.rpartition(":")
+        udp_addr = (host, int(port))
+        udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        print(f"[udp] 标注画面发送到 {udp_addr[0]}:{udp_addr[1]}"
+              f"（电脑上先运行: python udp_viewer.py --port {udp_addr[1]}）")
+    if args.udp_raw:
+        host, _, port = args.udp_raw.rpartition(":")
+        udp_raw_addr = (host, int(port))
+        udp_raw_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        print(f"[udp] 原始画面发送到 {udp_raw_addr[0]}:{udp_raw_addr[1]}"
+              f"（电脑上先运行: python udp_viewer.py --port {udp_raw_addr[1]} --save E:\\3）")
+
+    writer = None
+    if args.record:
+        writer = cv2.VideoWriter(args.record, cv2.VideoWriter_fourcc(*"mp4v"),
+                                 20.0, (cfg.cam_width, cfg.cam_height))
+        print(f"[record] 录制到 {args.record}")
+
+    frame_id = 0
+    last_seen = time.time()
+    last_sign = 1.0
+    last_print = 0.0
+    last_save = 0.0
+    last_error = None
+    last_steer = 0.0
+    lost_count = 0
+    prev_lost = False
+    turn_start = 0.0
+    turn_until = 0.0
+    left = right = 0.0
+    fps = 0.0
+    t_prev = time.time()
+
+    try:
+        while running:
+            ok, frame = cap.read()
+            if not ok or frame is None:
+                print("[camera] 读帧失败"); break
+            if frame.shape[1] != cfg.cam_width or frame.shape[0] != cfg.cam_height:
+                frame = cv2.resize(frame, (cfg.cam_width, cfg.cam_height))
+
+            error, info = analyze(frame, cfg)
+            now = time.time()
+
+            if error is None:
+                # --- 丢线：先直行0.1s，再左转0.5s，然后直行直到找到赛道 ---
+                if not prev_lost:                              # 新的一次丢线事件
+                    lost_count += 1
+                    prev_lost = True
+                    if lost_count == 1 and first_dir is None:
+                        apply(0, 0)                            # 先停车，等输入
+                        print("\n>>> 第 1 次丢线！请输入: 0=左转, 1=直线")
+                        try:
+                            _s = input("方向(0/1): ").strip()
+                            first_dir = 1 if _s == "1" else 0
+                        except Exception:
+                            first_dir = 0
+                        now = time.time()                      # 输入可能耗时，刷新时间
+                        last_seen = now
+                    turn_start = now + straight_delay          # 先直行
+                    turn_until = turn_start + lost_turn_time   # 再左转，之后直行
+                    _d = (first_dir if lost_count == 1 else 0) or 0
+                    print(f"[main] 第 {lost_count} 次丢线 -> "
+                          + ("直行%.1fs后左转%.1fs" % (straight_delay, lost_turn_time)
+                             if _d == 0 else "直行"))
+                pid.reset()
+                last_error = None
+                last_steer = 0.0
+                _d = (first_dir if lost_count == 1 else 0) or 0  # 0=左转, 1=直线
+                if lost_timeout > 0 and (now - last_seen) > lost_timeout:
+                    left = right = 0.0                           # 只有设了超时才停车
+                elif _d == 0 and now < turn_until:
+                    if now < turn_start:
+                        left = clamp(base - cfg.wheel_balance, MIN_SPEED, MAX_SPEED)   # 先直行0.1s
+                        right = clamp(base + cfg.wheel_balance, MIN_SPEED, MAX_SPEED)
+                    else:
+                        left = clamp(base - lost_speed, MIN_SPEED, MAX_SPEED)  # 再左转
+                        right = clamp(base + lost_speed, MIN_SPEED, MAX_SPEED)
+                else:
+                    left = clamp(base - cfg.wheel_balance, MIN_SPEED, MAX_SPEED)   # 直行找赛道
+                    right = clamp(base + cfg.wheel_balance, MIN_SPEED, MAX_SPEED)
+                apply(left, right)
+            else:
+                # ------- 逐轮连续 PID -------
+                prev_lost = False
+                last_seen = now
+                last_sign = 1.0 if error >= 0 else -1.0
+                last_error = error
+                steer = pid.update(error, now)
+                last_steer = steer
+                # 误差>0(赛道偏右) -> 车偏左 -> 左轮加速右轮减速
+                left = clamp(base + steer - cfg.wheel_balance, MIN_SPEED, MAX_SPEED)
+                right = clamp(base - steer + cfg.wheel_balance, MIN_SPEED, MAX_SPEED)
+                apply(left, right)
+
+            if cfg.show or cfg.save_debug or writer is not None or stream_on or udp_sock is not None:
+                vis = draw_debug(frame, error, info, last_steer, fps)
+                if stream_on or udp_sock is not None:
+                    ok2, jpg = cv2.imencode('.jpg', vis, [cv2.IMWRITE_JPEG_QUALITY, 70])
+                    if ok2:
+                        buf = jpg.tobytes()
+                        if stream_on:
+                            STREAM.set(buf)
+                        if udp_sock is not None and len(buf) <= 60000:
+                            try:
+                                udp_sock.sendto(buf, udp_addr)
+                            except Exception:
+                                pass
+                if writer is not None:
+                    writer.write(vis)
+                if cfg.save_debug and (now - last_save) > cfg.save_every:
+                    last_save = now
+                    cv2.imwrite(cfg.save_debug, vis)
+                if cfg.show:
+                    try:
+                        cv2.imshow("raspbot_line_follower", vis)
+                        if cv2.waitKey(1) & 0xFF in (ord('q'), 27):
+                            break
+                    except cv2.error as e:
+                        print(f"[warn] 无法显示窗口({e})，关闭 --show")
+                        cfg.show = False
+
+            if udp_raw_sock is not None:      # 发送原始画面（调参用）
+                okr, jpgr = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+                if okr:
+                    bufr = jpgr.tobytes()
+                    if len(bufr) <= 60000:
+                        try:
+                            udp_raw_sock.sendto(bufr, udp_raw_addr)
+                        except Exception:
+                            pass
+
+            if now - last_print > cfg.print_every:
+                last_print = now
+                if last_error is None:
+                    _d = (first_dir if lost_count == 1 else 0) or 0
+                    _ph = "直行" if (_d == 1 or now >= turn_start) else "先直行"
+                    print(f"[lost{lost_count:2d}] {'左转' if _d == 0 else '直线'} L={left:+.0f} "
+                          f"R={right:+.0f} ({_ph}) {fps:4.1f}fps")
+                else:
+                    print(f"[run  ] err={last_error:+.3f} steer={last_steer:+.0f} "
+                          f"L={left:+.0f} R={right:+.0f} {fps:4.1f}fps")
+
+            fps = 0.9 * fps + 0.1 * (1.0 / max(now - t_prev, 1e-6))
+            t_prev = now
+            frame_id += 1
+            if args.max_frames and frame_id >= args.max_frames:
+                print(f"[main] 已处理 {frame_id} 帧，退出")
+                break
+
+    except KeyboardInterrupt:
+        print("\n[main] KeyboardInterrupt，停车退出…")
+    finally:
+        print("[main] 停车，释放资源…")
+        wheels.stop()
+        time.sleep(0.05)
+        wheels.stop()
+        cap.release()          # 释放摄像头，否则下一个程序打不开 /dev/video0
+        if udp_sock is not None:
+            udp_sock.close()
+        if udp_raw_sock is not None:
+            udp_raw_sock.close()
+        if writer is not None:
+            writer.release()
+        del bot                # 释放驱动对象
+        if cfg.show:
+            cv2.destroyAllWindows()
+        print("[main] 已安全退出")
+
+
+if __name__ == "__main__":
+   main()
